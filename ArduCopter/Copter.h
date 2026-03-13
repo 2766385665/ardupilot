@@ -690,6 +690,12 @@ private:
     // Register a custom mode with given number and names
     AP_Vehicle::custom_mode_state* register_custom_mode(const uint8_t number, const char* full_name, const char* short_name) override;
 #endif
+            //my  customize code********************************
+    void reset_indoor_mission();
+    void trigger_indoor_mission();
+    void handle_custom_mavlink_command(const mavlink_command_long_t& cmd);
+    void indoor_mission();//my  customize code
+
 #if MODE_CIRCLE_ENABLED
     bool get_circle_radius(float &radius_m) override;
     bool set_circle_rate(float rate_dps) override;

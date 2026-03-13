@@ -81,6 +81,7 @@
 #include "version.h"
 #undef FORCE_VERSION_H_INCLUDE
 
+#define USERHOOK_SUPERSLOWLOOP
 const AP_HAL::HAL& hal = AP_HAL::get_HAL();
 
 #define SCHED_TASK(func, rate_hz, _max_time_micros, _prio) SCHED_TASK_CLASS(Copter, &copter, func, rate_hz, _max_time_micros, _prio)
@@ -149,6 +150,9 @@ const AP_Scheduler::Task Copter::scheduler_tasks[] = {
 #endif
 
     SCHED_TASK(rc_loop,              250,    130,  3),
+    //my test
+    SCHED_TASK( indoor_mission,100,130,4),
+    
     SCHED_TASK(throttle_loop,         50,     75,  6),
 #if AP_FENCE_ENABLED
     SCHED_TASK(fence_check,           25,    100,  7),
@@ -657,6 +661,7 @@ void Copter::loop_rate_logging()
 // should be run at 10hz
 void Copter::ten_hz_logging_loop()
 {
+     
     // always write AHRS attitude at 10Hz
     ahrs.Write_Attitude(attitude_control->get_att_target_euler_rad() * RAD_TO_DEG);
     // log attitude controller data if we're not already logging at the higher rate
