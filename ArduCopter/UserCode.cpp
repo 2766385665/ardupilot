@@ -1,4 +1,5 @@
 #include "Copter.h"
+#define USERHOOK_INIT
 #define USERHOOK_SUPERSLOWLOOP
 #include <cstdio>
 #include <AP_HAL/AP_HAL.h>
@@ -30,6 +31,36 @@ static bool takeoff_triggered = false;
 static bool ignore_prompted = false;
 static bool last_rc7_high = false;  // 记录上一次RC7是否为高
 static bool sensors_ready_prompted = false;
+static uint32_t last_mission_reset_msg_ms = 0; // 重置消息限频（ms），0表示未打印过
+static bool home_wait_prompted = false;  // Home未就绪提示只发一次
+static uint32_t last_prearm_wait_msg_ms = 0;
+static uint32_t last_arm_attempt_ms = 0;
+static uint32_t last_arm_fail_msg_ms = 0;
+
+// 读取当前相对原点的 NED 位置（米），不控制电机。返回 true 表示获取成功并填充 out_pos。
+static bool get_current_relative_pos_NED(Vector3p &out_pos)
+{
+    // 调用 AHRS 提供的接口，从 origin 获取相对位置（NED，单位米）
+    return AP::ahrs().get_relative_position_NED_origin(out_pos);
+}
+
+static bool get_current_optflow_debug(Vector2f &flow_rate, uint8_t &quality)
+{
+#if AP_OPTICALFLOW_ENABLED
+    AP_OpticalFlow *of = AP::opticalflow();
+    if (of == nullptr || !of->healthy()) {
+        return false;
+    }
+
+    flow_rate = of->flowRate();
+    quality = of->quality();
+    return true;
+#else
+    UNUSED(flow_rate);
+    UNUSED(quality);
+    return false;
+#endif
+}
 // 【新增】任务重置函数（执行完/异常结束时调用，恢复初始状态）
 void Copter::reset_indoor_mission()
 {
@@ -44,8 +75,15 @@ void Copter::reset_indoor_mission()
     ignore_prompted = false;  // 清空触发标志
     
     sensors_ready_prompted = false; // 新增：清空传感器就绪提示标记
+    home_wait_prompted = false;
+    last_prearm_wait_msg_ms = 0;
+    last_arm_attempt_ms = 0;
+    last_arm_fail_msg_ms = 0;
     
-    gcs().send_text(MAV_SEVERITY_INFO, "Mission reset! Ready for next trigger");
+    if (last_mission_reset_msg_ms == 0 || AP_HAL::millis() - last_mission_reset_msg_ms >= 5000) {
+        gcs().send_text(MAV_SEVERITY_INFO, "Mission reset! Ready for next trigger");
+        last_mission_reset_msg_ms = AP_HAL::millis();
+    }
 }
 
 void Copter::trigger_indoor_mission()
@@ -68,6 +106,7 @@ void Copter::trigger_indoor_mission()
         gcs().send_text(MAV_SEVERITY_INFO, "Mission triggered! Starting...");
     }
     ignore_prompted = false; // 重置提示标记，为下次触发做准备
+    last_mission_reset_msg_ms = 0; // 允许下一次重置时立即打印（节流重置）
 }
 
 // 实现Copter类的indoor_mission成员函数（带启停控制+无GPS适配）
@@ -77,9 +116,13 @@ void Copter::indoor_mission()
     const uint32_t TAKEOFF_TIMEOUT_MS = 15000;
     const uint32_t MOVE_TIMEOUT_MS = 8000; 
     const float TAKEOFF_TARGET_ALT_M = 1.0f;
+        const uint32_t STATUS_THROTTLE_MS = 1000;
+
+        static uint32_t last_ekf_wait_msg_ms = 0;
+        static uint32_t last_relpos_wait_msg_ms = 0;
 
      uint16_t rc7_pwm = RC_Channels::get_radio_in(6);
-
+  //trigger_indoor_mission();
       bool curr_rc7_high = (rc7_pwm > 1800);
     if (curr_rc7_high && !last_rc7_high) {
         // 上升沿：从低变高 → 触发任务
@@ -129,9 +172,10 @@ void Copter::indoor_mission()
             // 2. 接收 set_home 的返回值，检查是否设置 Home 点成功
             bool set_home_ok = AP::ahrs().set_home(home_loc);
             if (set_home_ok) {
-                gcs().send_text(MAV_SEVERITY_INFO, "✅ Home set via AP::ahrs()! No GPS mode.");
+                gcs().send_text(MAV_SEVERITY_INFO, "Home set via AP::ahrs() in no-GPS mode.");
+                home_wait_prompted = false;
             } else {
-                gcs().send_text(MAV_SEVERITY_ERROR, "❌ Failed to set home from current location!");
+                gcs().send_text(MAV_SEVERITY_WARNING, "Failed to set home from current location.");
             }
         } else {
             // 兜底逻辑：获取当前位置失败，尝试用 AHRS 原点设置
@@ -140,12 +184,15 @@ void Copter::indoor_mission()
             if (get_origin_ok) {
                 bool set_home_from_origin_ok = AP::ahrs().set_home(origin_loc);
                 if (set_home_from_origin_ok) {
-                    gcs().send_text(MAV_SEVERITY_INFO, "✅ Home set from AHRS origin!");
+                    gcs().send_text(MAV_SEVERITY_INFO, "Home set from AHRS origin.");
+                    home_wait_prompted = false;
                 } else {
-                    gcs().send_text(MAV_SEVERITY_ERROR, "❌ Failed to set home from origin!");
+                    gcs().send_text(MAV_SEVERITY_WARNING, "Failed to set home from AHRS origin.");
                 }
-            } else {
-                gcs().send_text(MAV_SEVERITY_ERROR, "❌ Failed to get current location and origin! Home not set!");
+            } else if (!home_wait_prompted) {
+                // During EKF/flow startup this can be expected; keep this one-shot per mission.
+                gcs().send_text(MAV_SEVERITY_INFO, "Home not set yet: waiting for EKF origin/position.");
+                home_wait_prompted = true;
             }
         }
     }
@@ -155,7 +202,10 @@ void Copter::indoor_mission()
     // 1. 检查AHRS（EKF）健康
     if (!ahrs.healthy()) {
         if (AP_HAL::millis() - ekf_wait_start < 10000) { // 10秒内持续提示
-            gcs().send_text(MAV_SEVERITY_INFO, "Waiting for EKF healthy (flow/rangefinder)...");
+            if (AP_HAL::millis() - last_ekf_wait_msg_ms >= STATUS_THROTTLE_MS) {
+                gcs().send_text(MAV_SEVERITY_INFO, "Waiting for EKF healthy (flow/rangefinder)...");
+                last_ekf_wait_msg_ms = AP_HAL::millis();
+            }
         } else { // 10秒超时后，仿真环境强制跳过（避免卡死）
             gcs().send_text(MAV_SEVERITY_WARNING, "EKF wait timeout, skip check (sim only)!");
         }
@@ -165,14 +215,43 @@ void Copter::indoor_mission()
     }
 
     // 2. 检查EKF相对位置（仿真适配）
-    if (!ekf_has_relative_position()) {
-        if (AP_HAL::millis() - ekf_wait_start < 10000) {
-            gcs().send_text(MAV_SEVERITY_INFO, "Waiting for relative position (flow)...");
-        } else {
-            gcs().send_text(MAV_SEVERITY_WARNING, "Relative position wait timeout, skip check (sim only)!");
+    // 优先使用AHRS相对位置；若其暂不可用，则允许使用pos_control估计作为fallback继续任务。
+    bool rel_pos_ok = ekf_has_relative_position();
+    bool rel_pos_fallback_ok = false;
+    if (!rel_pos_ok) {
+        nav_filter_status nav_status{};
+        const bool nav_status_ok = AP::ahrs().get_filter_status(nav_status);
+        Location origin_loc;
+        const bool origin_ok = AP::ahrs().get_origin(origin_loc);
+
+#if AP_OPTICALFLOW_ENABLED
+        AP_OpticalFlow *of = AP::opticalflow();
+        const bool flow_ok = (of != nullptr) && of->enabled() && of->healthy() && (of->quality() > 0);
+#else
+        const bool flow_ok = false;
+#endif
+
+        const Vector3p &pos_est_ned_m = pos_control->get_pos_estimate_NED_m();
+        const bool pos_est_moved = !is_zero((float)pos_est_ned_m.z);
+
+        rel_pos_fallback_ok = nav_status_ok && nav_status.flags.initalized && nav_status.flags.horiz_vel &&
+                              AP::ahrs().home_is_set() && origin_ok && flow_ok && pos_est_moved;
+
+        if (!rel_pos_fallback_ok) {
+            if (AP_HAL::millis() - ekf_wait_start < 10000) {
+                if (AP_HAL::millis() - last_relpos_wait_msg_ms >= STATUS_THROTTLE_MS) {
+                    gcs().send_text(MAV_SEVERITY_INFO, "Waiting for relative position (flow)...");
+                    last_relpos_wait_msg_ms = AP_HAL::millis();
+                }
+            } else {
+                gcs().send_text(MAV_SEVERITY_WARNING, "Relative position wait timeout, skip check (sim only)!");
+            }
+            mission_running = false;
+            if (AP_HAL::millis() - ekf_wait_start < 10000) return;
+        } else if (AP_HAL::millis() - last_relpos_wait_msg_ms >= STATUS_THROTTLE_MS) {
+            gcs().send_text(MAV_SEVERITY_INFO, "Relative pos fallback active: using pos_control estimate");
+            last_relpos_wait_msg_ms = AP_HAL::millis();
         }
-        mission_running = false;
-        if (AP_HAL::millis() - ekf_wait_start < 10000) return;
     }
 
     // 3. 检查测距仪数据（核心修复：改用仿真默认朝向 ROTATION_NONE）
@@ -191,6 +270,9 @@ void Copter::indoor_mission()
     if (!sensors_ready_prompted) {
         gcs().send_text(MAV_SEVERITY_INFO, "All sensors ready! Start mission...");
         sensors_ready_prompted = true;
+        
+        // 【新增】传感器就绪后立即尝试设置EKF原点（无GPS环境下这很关键）
+        set_ekf_origin_from_current();
     }
 
     ekf_wait_start = 0;
@@ -225,11 +307,30 @@ void Copter::indoor_mission()
 
             // 3. 解锁电机
             if (!motors->armed()) {
+                const uint32_t now_ms = AP_HAL::millis();
+
+                // Pre-arm未通过时不尝试解锁，避免Gyro等检查失败刷屏
+                if (!AP::arming().pre_arm_checks(false)) {
+                    if (now_ms - last_prearm_wait_msg_ms >= STATUS_THROTTLE_MS) {
+                        gcs().send_text(MAV_SEVERITY_INFO, "Pre-arm checks not ready, waiting...");
+                        last_prearm_wait_msg_ms = now_ms;
+                    }
+                    return;
+                }
+
+                // 通过检查后，解锁尝试也做限频，避免瞬时重复调用
+                if (now_ms - last_arm_attempt_ms < STATUS_THROTTLE_MS) {
+                    return;
+                }
+                last_arm_attempt_ms = now_ms;
+
                 bool arm_ok = AP::arming().arm(AP_Arming::Method::SCRIPTING, true);
                 if (!arm_ok) {
-                    gcs().send_text(MAV_SEVERITY_ERROR, "Arm failed!");
+                    if (now_ms - last_arm_fail_msg_ms >= STATUS_THROTTLE_MS) {
+                        gcs().send_text(MAV_SEVERITY_WARNING, "Arm failed, retrying...");
+                        last_arm_fail_msg_ms = now_ms;
+                    }
                    // reset_indoor_mission(); // 解锁失败，重置任务
-                    mission_running = false; 
                     return;
                 }
                 gcs().send_text(MAV_SEVERITY_INFO, "Armed success");
@@ -483,9 +584,62 @@ void Copter::indoor_mission()
     }
 }
 
-// ====================== 可选：添加地面站触发方式（测试用） ======================
-// 在MAVProxy控制台输入 "trigger_mission" 即可触发任务
-// 需在Copter类中注册该指令（参考ArduPilot自定义指令文档）
+
+
+// 【新增】手动设置EKF原点 - 从当前AHRS位置或指定经纬度/高度
+void Copter::set_ekf_origin_from_current()
+{
+    Location loc;
+    
+    // 优先尝试从AHRS获取当前位置
+    if (AP::ahrs().get_location(loc)) {
+        if (AP::ahrs().set_origin(loc)) {
+            gcs().send_text(MAV_SEVERITY_INFO, "✓ EKF Origin SET from AHRS location: Lat=%.7f, Lon=%.7f, Alt=%.2fm",
+                            (double)loc.lat * 1e-7, (double)loc.lng * 1e-7, (double)loc.alt * 0.01);
+
+            // In no-GPS testing, origin alone is not enough for some relative position APIs.
+            if (!AP::ahrs().home_is_set()) {
+                if (AP::ahrs().set_home(loc)) {
+                    gcs().send_text(MAV_SEVERITY_INFO, "✓ Home SET together with EKF origin");
+                } else {
+                    gcs().send_text(MAV_SEVERITY_WARNING, "✗ EKF origin set but Home set failed");
+                }
+            }
+            return;
+        } else {
+            gcs().send_text(MAV_SEVERITY_WARNING, "✗ Failed to set EKF origin from AHRS location");
+        }
+    } else {
+        gcs().send_text(MAV_SEVERITY_WARNING, "✗ AHRS location not available, cannot set origin");
+    }
+}
+
+// 【新增】将 EKF 原点设置为固定测试坐标（用于本地化/zg函数测试）
+void Copter::set_ekf_origin_to_test()
+{
+    Location loc;
+    // 示例测试坐标：经纬度使用 1e7 单位，海拔使用厘米
+    // 请根据你的测试场景修改下面的坐标（目前为: Lat=30.0000000 Lon=120.0000000 Alt=1.00m）
+    loc.lat = (int32_t)(30.0 * 1e7);
+    loc.lng = (int32_t)(120.0 * 1e7);
+    loc.alt = (int32_t)(1.0 * 100.0); // 1.00 m -> 100 cm
+
+    if (AP::ahrs().set_origin(loc)) {
+        gcs().send_text(MAV_SEVERITY_INFO, "✓ EKF Test Origin SET: Lat=%.7f Lon=%.7f Alt=%.2fm",
+                        (double)loc.lat * 1e-7, (double)loc.lng * 1e-7, (double)loc.alt * 0.01);
+
+        if (!AP::ahrs().home_is_set()) {
+            if (AP::ahrs().set_home(loc)) {
+                gcs().send_text(MAV_SEVERITY_INFO, "✓ Home SET from test origin");
+            } else {
+                gcs().send_text(MAV_SEVERITY_WARNING, "✗ Test origin set but Home set failed");
+            }
+        }
+    } else {
+        gcs().send_text(MAV_SEVERITY_WARNING, "✗ Failed to set EKF Test Origin");
+    }
+}
+
 void Copter::handle_custom_mavlink_command(const mavlink_command_long_t& cmd)
 {
     if (cmd.command == MAV_CMD_USER_1) { // 自定义指令1作为触发信号
@@ -500,8 +654,8 @@ void Copter::handle_custom_mavlink_command(const mavlink_command_long_t& cmd)
 #ifdef USERHOOK_INIT
 void Copter::userhook_init()
 {
-    // put your initialisation code here
-    // this will be called once at start-up
+    // 在初始化时尝试通过当前 AHRS/GPS 位置设置 EKF 原点/Home，便于无GPS或仿真环境下定位
+    set_ekf_origin_from_current();
 }
 #endif
 
@@ -536,31 +690,122 @@ void Copter::userhook_SlowLoop()
 #ifdef USERHOOK_SUPERSLOWLOOP
 void Copter::userhook_SuperSlowLoop()
 {
-   /*  hal.console->println("hello 1");  
-    Vector3f euler = attitude_control->get_att_target_euler_rad();
-    float roll_deg  = euler.x * RAD_TO_DEG;
-    float pitch_deg = euler.y * RAD_TO_DEG;
-    float yaw_deg   = euler.z * RAD_TO_DEG;
+    // 每秒分步骤验证：惯导 -> 光流 -> 相对位置
+    static uint32_t last_report_ms = 0;
+    const uint32_t REPORT_INTERVAL_MS = 1000;
 
-    hal.console->printf("roll: %.2f, pitch: %.2f, yaw: %.2f\n", roll_deg, pitch_deg, yaw_deg);
+    if (AP_HAL::millis() - last_report_ms < REPORT_INTERVAL_MS) {
+        return;
+    }
+    last_report_ms = AP_HAL::millis();
 
-   
- // 发送 MAVLink STATUSTEXT
-    char msg[50];
-    snprintf(msg, sizeof(msg), "roll: %.2f, pitch: %.2f, yaw: %.2f", roll_deg, pitch_deg, yaw_deg);
-    send_status_text(msg);
-  
-*/
-    // put your 1Hz code here
+    // RC8 上升沿触发：设置为测试原点（只触发一次上升沿）
+    static bool last_rc8_high = false;
+    uint16_t rc8_pwm = RC_Channels::get_radio_in(7);
+    bool rc8_high = (rc8_pwm > 1800);
+    if (rc8_high && !last_rc8_high) {
+        // 上升沿：执行一次测试原点设置
+        set_ekf_origin_to_test();
+    }
+    last_rc8_high = rc8_high;
+
+    nav_filter_status nav_status{};
+    const bool nav_status_ok = AP::ahrs().get_filter_status(nav_status);
+
+    if (!AP::ahrs().have_inertial_nav()) {
+        send_status_text("Step1: inertial nav not ready");
+        return;
+    }
+
+    char status_buf[160];
+
+    Location ahrs_loc;
+    const bool current_loc_ok = AP::ahrs().get_location(ahrs_loc);
+    Location origin_loc;
+    const bool origin_ok = AP::ahrs().get_origin(origin_loc);
+    bool home_ok = AP::ahrs().home_is_set();
+
+    // Keep trying to set Home from origin in no-GPS test cases.
+    if (!home_ok && origin_ok) {
+        if (AP::ahrs().set_home(origin_loc)) {
+            home_ok = true;
+            send_status_text("Step1a+: home set from origin in SuperSlowLoop");
+        }
+    }
+
+    snprintf(status_buf, sizeof(status_buf), "Step1a: home:%d origin:%d loc:%d", (int)home_ok, (int)origin_ok, (int)current_loc_ok);
+    send_status_text(status_buf);
+
+    if (nav_status_ok) {
+        snprintf(status_buf, sizeof(status_buf), "Step1b: rel:%d pred:%d abs:%d const:%d", (int)nav_status.flags.horiz_pos_rel, (int)nav_status.flags.pred_horiz_pos_rel, (int)nav_status.flags.horiz_pos_abs, (int)nav_status.flags.const_pos_mode);
+        send_status_text(status_buf);
+
+        snprintf(status_buf, sizeof(status_buf), "Step1c: takeoff:%d gps:%d init:%d dead:%d", (int)nav_status.flags.takeoff_detected, (int)nav_status.flags.using_gps, (int)nav_status.flags.initalized, (int)nav_status.flags.dead_reckoning);
+        send_status_text(status_buf);
+    } else {
+        send_status_text("Step1b: nav status unavailable");
+    }
+
+    Vector2f flow_rate;
+    uint8_t quality = 0;
+    if (get_current_optflow_debug(flow_rate, quality)) {
+        snprintf(status_buf, sizeof(status_buf), "Step2: optflow q:%u fx:%.3f fy:%.3f", quality, (double)flow_rate.x, (double)flow_rate.y);
+        send_status_text(status_buf);
+    } else {
+        send_status_text("Step2: optflow not ready");
+        return;
+    }
+
+    Vector3p rel_pos;
+    if (get_current_relative_pos_NED(rel_pos)) {
+        snprintf(status_buf, sizeof(status_buf), "Step3: Rel N:%.2f E:%.2f D:%.2f", rel_pos.x, rel_pos.y, rel_pos.z);
+        send_status_text(status_buf);
+    } else {
+        send_status_text("Step3: ✗ rel pos unavailable");
+
+        // 【增强调试输出】查看EKF标志详细信息
+        if (nav_status_ok) {
+            snprintf(status_buf, sizeof(status_buf), "Step3b: rel:%d pred:%d abs:%d const:%d", (int)nav_status.flags.horiz_pos_rel, (int)nav_status.flags.pred_horiz_pos_rel, (int)nav_status.flags.horiz_pos_abs, (int)nav_status.flags.const_pos_mode);
+            send_status_text(status_buf);
+
+            snprintf(status_buf, sizeof(status_buf), "Step3c: init:%d dead:%d takeoff:%d gps:%d vel:%d", (int)nav_status.flags.initalized, (int)nav_status.flags.dead_reckoning, (int)nav_status.flags.takeoff_detected, (int)nav_status.flags.using_gps, (int)nav_status.flags.horiz_vel);
+            send_status_text(status_buf);
+        }
+
+        // 【增强调试输出】查看光流是否启用和融合状态
+#if AP_OPTICALFLOW_ENABLED
+        AP_OpticalFlow *of = AP::opticalflow();
+        if (of != nullptr) {
+            snprintf(status_buf, sizeof(status_buf), "Step3d: optflow_enabled:%d optflow_healthy:%d", (int)of->enabled(), (int)of->healthy());
+            send_status_text(status_buf);
+        }
+#endif
+
+        // 【增强调试输出】显示position_control的估计值
+        const Vector3p &pos_est_ned_m = pos_control->get_pos_estimate_NED_m();
+        snprintf(status_buf, sizeof(status_buf),
+                 "Step3e: pos_control_est N:%.2f E:%.2f D:%.2f",
+                 pos_est_ned_m.x,
+                 pos_est_ned_m.y,
+                 pos_est_ned_m.z);
+        send_status_text(status_buf);
+
+        // If AHRS relative position is unavailable, surface position-controller estimate as fallback.
+        snprintf(status_buf, sizeof(status_buf),
+             "Step3e+: fallback_rel N:%.2f E:%.2f D:%.2f",
+             pos_est_ned_m.x,
+             pos_est_ned_m.y,
+             pos_est_ned_m.z);
+        send_status_text(status_buf);
+
+        // 【增强调试输出】尝试显示ekf_alt_ok状态
+        snprintf(status_buf, sizeof(status_buf), "Step3f: ekf_alt_ok:%d ahrs_healthy:%d motors_armed:%d", (int)ekf_alt_ok(), (int)ahrs.healthy(), (int)motors->armed());
+        send_status_text(status_buf);
+    }
 }
 #endif
 
 #ifdef USERHOOK_AUXSWITCH
-void Copter::userhook_auxSwitch1(const RC_Channel::AuxSwitchPos ch_flag)
-{
-    // put your aux switch #1 handler here (CHx_OPT = 47)
-}
-
 void Copter::userhook_auxSwitch2(const RC_Channel::AuxSwitchPos ch_flag)
 {
     // put your aux switch #2 handler here (CHx_OPT = 48)

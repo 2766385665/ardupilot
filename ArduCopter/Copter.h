@@ -674,6 +674,16 @@ private:
 #endif // MODE_GUIDED_ENABLED
 #endif // AP_SCRIPTING_ENABLED || AP_EXTERNAL_CONTROL_ENABLED
 
+
+            //my  customize code********************************
+    void reset_indoor_mission();
+    void trigger_indoor_mission();
+    void handle_custom_mavlink_command(const mavlink_command_long_t& cmd);
+    void set_ekf_origin_from_current();  // 手动设置EKF原点
+    void indoor_mission();//my  customize code
+    void set_ekf_origin_to_test();
+
+    
 #if AP_SCRIPTING_ENABLED
 #if MODE_GUIDED_ENABLED
     bool get_target_location(Location& target_loc) override;
@@ -690,11 +700,6 @@ private:
     // Register a custom mode with given number and names
     AP_Vehicle::custom_mode_state* register_custom_mode(const uint8_t number, const char* full_name, const char* short_name) override;
 #endif
-            //my  customize code********************************
-    void reset_indoor_mission();
-    void trigger_indoor_mission();
-    void handle_custom_mavlink_command(const mavlink_command_long_t& cmd);
-    void indoor_mission();//my  customize code
 
 #if MODE_CIRCLE_ENABLED
     bool get_circle_radius(float &radius_m) override;

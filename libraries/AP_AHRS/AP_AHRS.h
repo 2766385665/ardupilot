@@ -955,7 +955,6 @@ private:
 
     // returns the inertial navigation origin in lat/lon/alt
     bool _get_origin(Location &ret) const WARN_IF_UNUSED;
-
     // return origin for a specified EKF type
     bool _get_origin(EKFType type, Location &ret) const;
 
